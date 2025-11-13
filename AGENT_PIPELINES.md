@@ -400,3 +400,293 @@ if (name === ToolName.ELICITATION) {
 
 ---
 
+## 2. Fetch Server Pipelines
+
+Fetch Server предоставляет функциональность для загрузки веб-контента и его конвертации в markdown.
+
+**Расположение**: `src/fetch/src/mcp_server_fetch/server.py`
+
+### 2.1. Autonomous Fetch Pipeline (Автоматическая загрузка через инструмент)
+
+**Назначение**: Автоматическая загрузка веб-страницы с проверкой robots.txt для автономных запросов.
+
+**Триггер**: Вызов инструмента `fetch`
+
+**Схема потока данных**:
+```
+┌─────────────────────────────────────────────────────────────────┐
+│               Autonomous Fetch Pipeline                          │
+└─────────────────────────────────────────────────────────────────┘
+
+1. AI Agent вызывает tool
+   ↓
+┌──────────────────────────────────────────────────────────────────┐
+│ Tool: fetch                                                       │
+│ Input: {                                                          │
+│   url: string,                                                    │
+│   max_length: number (default: 5000),                            │
+│   start_index: number (default: 0),                              │
+│   raw: boolean (default: false)                                  │
+│ }                                                                 │
+└──────────────────────────────────────────────────────────────────┘
+   ↓
+2. Сервер проверяет robots.txt (если не ignore_robots_txt)
+   ↓
+┌──────────────────────────────────────────────────────────────────┐
+│ check_may_autonomously_fetch_url()                               │
+│ GET https://example.com/robots.txt                               │
+│ User-Agent: ModelContextProtocol/1.0 (Autonomous; ...)          │
+│                                                                   │
+│ Проверяет:                                                        │
+│ - Доступность robots.txt (игнорирует 404)                        │
+│ - Правила для user-agent                                         │
+│ - Разрешен ли доступ к URL                                       │
+└──────────────────────────────────────────────────────────────────┘
+   ↓
+3a. Если robots.txt запрещает
+   ↓
+┌──────────────────────────────────────────────────────────────────┐
+│ McpError                                                          │
+│ "The sites robots.txt specifies that autonomous fetching         │
+│  of this page is not allowed"                                    │
+│                                                                   │
+│ Рекомендация: использовать fetch prompt для ручной загрузки     │
+└──────────────────────────────────────────────────────────────────┘
+
+3b. Если robots.txt разрешает или отсутствует
+   ↓
+┌──────────────────────────────────────────────────────────────────┐
+│ fetch_url()                                                       │
+│ GET <url>                                                         │
+│ User-Agent: ModelContextProtocol/1.0 (Autonomous; ...)          │
+│ Timeout: 30 seconds                                               │
+│ Follow redirects: Yes                                             │
+└──────────────────────────────────────────────────────────────────┘
+   ↓
+4. Анализ content-type и конвертация
+   ↓
+┌──────────────────────────────────────────────────────────────────┐
+│ Content-Type Analysis                                             │
+│                                                                   │
+│ If HTML && !raw:                                                  │
+│   ├─> readabilipy.simple_json_from_html_string()                │
+│   │    (упрощение HTML)                                          │
+│   └─> markdownify.markdownify()                                  │
+│        (конвертация в Markdown)                                   │
+│                                                                   │
+│ Else:                                                             │
+│   └─> return raw content                                          │
+└──────────────────────────────────────────────────────────────────┘
+   ↓
+5. Обработка длины и truncation
+   ↓
+┌──────────────────────────────────────────────────────────────────┐
+│ Length Processing                                                 │
+│                                                                   │
+│ content = content[start_index : start_index + max_length]       │
+│                                                                   │
+│ If truncated && has more content:                                │
+│   └─> Add message: "Content truncated. Call fetch with          │
+│        start_index=N to get more content."                        │
+└──────────────────────────────────────────────────────────────────┘
+   ↓
+6. Возврат результата
+   ↓
+┌──────────────────────────────────────────────────────────────────┐
+│ Tool Response                                                     │
+│ {                                                                 │
+│   type: "text",                                                   │
+│   text: "Contents of <url>:\n<markdown_content>"                 │
+│ }                                                                 │
+│                                                                   │
+│ Или (если truncated):                                            │
+│ {                                                                 │
+│   type: "text",                                                   │
+│   text: "Contents of <url>:\n<partial_content>\n\n              │
+│          <error>Content truncated. Call the fetch tool with      │
+│          a start_index of 5000 to get more content.</error>"     │
+│ }                                                                 │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+**Код реализации**:
+```python
+@server.call_tool()
+async def call_tool(name, arguments: dict) -> list[TextContent]:
+    try:
+        args = Fetch(**arguments)
+    except ValueError as e:
+        raise McpError(ErrorData(code=INVALID_PARAMS, message=str(e)))
+
+    url = str(args.url)
+    if not url:
+        raise McpError(ErrorData(code=INVALID_PARAMS, message="URL is required"))
+
+    # Проверка robots.txt для автономных запросов
+    if not ignore_robots_txt:
+        await check_may_autonomously_fetch_url(url, user_agent_autonomous, proxy_url)
+
+    # Загрузка контента
+    content, prefix = await fetch_url(
+        url, user_agent_autonomous, force_raw=args.raw, proxy_url=proxy_url
+    )
+
+    # Обработка длины
+    original_length = len(content)
+    if args.start_index >= original_length:
+        content = "<error>No more content available.</error>"
+    else:
+        truncated_content = content[args.start_index : args.start_index + args.max_length]
+        if not truncated_content:
+            content = "<error>No more content available.</error>"
+        else:
+            content = truncated_content
+            actual_content_length = len(truncated_content)
+            remaining_content = original_length - (args.start_index + actual_content_length)
+
+            if actual_content_length == args.max_length and remaining_content > 0:
+                next_start = args.start_index + actual_content_length
+                content += f"\n\n<error>Content truncated. Call the fetch tool with a start_index of {next_start} to get more content.</error>"
+
+    return [TextContent(type="text", text=f"{prefix}Contents of {url}:\n{content}")]
+```
+
+**Параметры**:
+- **url**: URL для загрузки
+- **max_length**: Максимальная длина возвращаемого контента (default: 5000)
+- **start_index**: Начальная позиция для продолжения (default: 0)
+- **raw**: Вернуть сырой HTML вместо markdown (default: false)
+
+**User-Agent**: `ModelContextProtocol/1.0 (Autonomous; +https://github.com/modelcontextprotocol/servers)`
+
+**Особенности**:
+- Проверка robots.txt обязательна (если не отключена)
+- Автоматическая конвертация HTML в Markdown
+- Поддержка пагинации через start_index
+- Обработка redirects
+
+---
+
+### 2.2. Manual Fetch Pipeline (Ручная загрузка через промт)
+
+**Назначение**: Ручная загрузка веб-страницы пользователем, без проверки robots.txt.
+
+**Триггер**: Использование промта `fetch`
+
+**Схема потока данных**:
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                Manual Fetch Pipeline                             │
+└─────────────────────────────────────────────────────────────────┘
+
+1. User использует prompt
+   ↓
+┌──────────────────────────────────────────────────────────────────┐
+│ Prompt: fetch                                                     │
+│ Arguments: { url: string }                                       │
+└──────────────────────────────────────────────────────────────────┘
+   ↓
+2. Сервер загружает URL (БЕЗ проверки robots.txt)
+   ↓
+┌──────────────────────────────────────────────────────────────────┐
+│ fetch_url()                                                       │
+│ GET <url>                                                         │
+│ User-Agent: ModelContextProtocol/1.0 (User-Specified; ...)      │
+│ Timeout: 30 seconds                                               │
+│ Follow redirects: Yes                                             │
+│                                                                   │
+│ NO robots.txt check!                                              │
+└──────────────────────────────────────────────────────────────────┘
+   ↓
+3. Конвертация контента (аналогично autonomous)
+   ↓
+┌──────────────────────────────────────────────────────────────────┐
+│ HTML → Markdown conversion                                        │
+│ (если контент HTML)                                               │
+└──────────────────────────────────────────────────────────────────┘
+   ↓
+4. Возврат результата как промт
+   ↓
+┌──────────────────────────────────────────────────────────────────┐
+│ GetPromptResult                                                   │
+│ {                                                                 │
+│   description: "Contents of <url>",                              │
+│   messages: [                                                     │
+│     {                                                             │
+│       role: "user",                                               │
+│       content: {                                                  │
+│         type: "text",                                             │
+│         text: "<prefix><markdown_content>"                        │
+│       }                                                           │
+│     }                                                             │
+│   ]                                                               │
+│ }                                                                 │
+│                                                                   │
+│ Или (если ошибка):                                               │
+│ {                                                                 │
+│   description: "Failed to fetch <url>",                          │
+│   messages: [                                                     │
+│     {                                                             │
+│       role: "user",                                               │
+│       content: {                                                  │
+│         type: "text",                                             │
+│         text: "<error_message>"                                   │
+│       }                                                           │
+│     }                                                             │
+│   ]                                                               │
+│ }                                                                 │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+**Код реализации**:
+```python
+@server.get_prompt()
+async def get_prompt(name: str, arguments: dict | None) -> GetPromptResult:
+    if not arguments or "url" not in arguments:
+        raise McpError(ErrorData(code=INVALID_PARAMS, message="URL is required"))
+
+    url = arguments["url"]
+
+    try:
+        # Использует user_agent_manual (без проверки robots.txt)
+        content, prefix = await fetch_url(url, user_agent_manual, proxy_url=proxy_url)
+    except McpError as e:
+        return GetPromptResult(
+            description=f"Failed to fetch {url}",
+            messages=[
+                PromptMessage(
+                    role="user",
+                    content=TextContent(type="text", text=str(e)),
+                )
+            ],
+        )
+
+    return GetPromptResult(
+        description=f"Contents of {url}",
+        messages=[
+            PromptMessage(
+                role="user",
+                content=TextContent(type="text", text=prefix + content)
+            )
+        ],
+    )
+```
+
+**Параметры**:
+- **url**: URL для загрузки (обязательный)
+
+**User-Agent**: `ModelContextProtocol/1.0 (User-Specified; +https://github.com/modelcontextprotocol/servers)`
+
+**Отличия от Autonomous Fetch**:
+- ❌ НЕ проверяет robots.txt
+- ❌ НЕ поддерживает пагинацию (start_index/max_length)
+- ✅ Возвращает весь контент сразу
+- ✅ Используется когда robots.txt запрещает автономную загрузку
+
+**Когда использовать**:
+- Когда autonomous fetch заблокирован robots.txt
+- Когда пользователь явно хочет загрузить контент
+- Для одноразовой загрузки небольших страниц
+
+---
+
