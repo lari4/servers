@@ -1036,3 +1036,347 @@ export class SequentialThinkingServer {
 
 ---
 
+## 4. Memory Server Pipelines
+
+Memory Server управляет графом знаний с сущностями, отношениями и наблюдениями, хранящимся в JSONL формате.
+
+**Расположение**: `src/memory/index.ts`
+
+### 4.1. Knowledge Graph Building Pipeline (Построение графа знаний)
+
+**Назначение**: Постепенное создание и расширение графа знаний через добавление сущностей, отношений и наблюдений.
+
+**Триггер**: Последовательные вызовы инструментов create_entities, create_relations, add_observations
+
+**Схема потока данных**:
+```
+┌─────────────────────────────────────────────────────────────────┐
+│         Knowledge Graph Building Pipeline                       │
+└─────────────────────────────────────────────────────────────────┘
+
+ШАГ 1: Создание сущностей
+   ↓
+┌──────────────────────────────────────────────────────────────────┐
+│ Tool: create_entities                                             │
+│ {                                                                 │
+│   entities: [                                                     │
+│     {                                                             │
+│       name: "Alice",                                              │
+│       entityType: "person",                                       │
+│       observations: ["Software engineer", "Works at TechCorp"]    │
+│     },                                                            │
+│     {                                                             │
+│       name: "TechCorp",                                           │
+│       entityType: "company",                                      │
+│       observations: ["Tech company", "Founded in 2020"]           │
+│     }                                                             │
+│   ]                                                               │
+│ }                                                                 │
+└──────────────────────────────────────────────────────────────────┘
+   ↓
+Server: loadGraph() → проверка дубликатов → saveGraph()
+   ↓
+┌──────────────────────────────────────────────────────────────────┐
+│ KnowledgeGraphManager.createEntities()                           │
+│                                                                   │
+│ 1. Загрузка текущего графа из memory.jsonl                       │
+│ 2. Фильтрация: убирает сущности с существующими именами         │
+│ 3. Добавление новых сущностей в graph.entities                  │
+│ 4. Сохранение в JSONL:                                           │
+│    {"type":"entity","name":"Alice",...}                          │
+│    {"type":"entity","name":"TechCorp",...}                       │
+└──────────────────────────────────────────────────────────────────┘
+   ↓
+Response: [<новые_сущности>]
+
+═══════════════════════════════════════════════════════════════════
+
+ШАГ 2: Создание отношений
+   ↓
+┌──────────────────────────────────────────────────────────────────┐
+│ Tool: create_relations                                            │
+│ {                                                                 │
+│   relations: [                                                    │
+│     {                                                             │
+│       from: "Alice",                                              │
+│       to: "TechCorp",                                             │
+│       relationType: "works_at"                                    │
+│     }                                                             │
+│   ]                                                               │
+│ }                                                                 │
+└──────────────────────────────────────────────────────────────────┘
+   ↓
+Server: loadGraph() → проверка дубликатов → saveGraph()
+   ↓
+┌──────────────────────────────────────────────────────────────────┐
+│ KnowledgeGraphManager.createRelations()                          │
+│                                                                   │
+│ 1. Загрузка графа                                                │
+│ 2. Фильтрация дубликатов (from + to + relationType)             │
+│ 3. Добавление новых relations                                    │
+│ 4. Сохранение:                                                    │
+│    {"type":"relation","from":"Alice","to":"TechCorp",...}        │
+└──────────────────────────────────────────────────────────────────┘
+   ↓
+Response: [<новые_отношения>]
+
+═══════════════════════════════════════════════════════════════════
+
+ШАГ 3: Добавление наблюдений
+   ↓
+┌──────────────────────────────────────────────────────────────────┐
+│ Tool: add_observations                                            │
+│ {                                                                 │
+│   observations: [                                                 │
+│     {                                                             │
+│       entityName: "Alice",                                        │
+│       contents: [                                                 │
+│         "Knows Python and TypeScript",                            │
+│         "Interested in AI/ML"                                     │
+│       ]                                                           │
+│     }                                                             │
+│   ]                                                               │
+│ }                                                                 │
+└──────────────────────────────────────────────────────────────────┘
+   ↓
+Server: loadGraph() → find entity → append observations → saveGraph()
+   ↓
+┌──────────────────────────────────────────────────────────────────┐
+│ KnowledgeGraphManager.addObservations()                          │
+│                                                                   │
+│ 1. Загрузка графа                                                │
+│ 2. Для каждого entityName:                                       │
+│    - Найти сущность (throw Error если не найдена)               │
+│    - Фильтровать дубликаты наблюдений                           │
+│    - Добавить новые в entity.observations                        │
+│ 3. Пересохранить весь граф                                       │
+└──────────────────────────────────────────────────────────────────┘
+   ↓
+Response: [
+  {
+    entityName: "Alice",
+    addedObservations: ["Knows Python and TypeScript", "Interested in AI/ML"]
+  }
+]
+
+═══════════════════════════════════════════════════════════════════
+
+Результат: Граф знаний
+   ↓
+┌──────────────────────────────────────────────────────────────────┐
+│ memory.jsonl содержит:                                            │
+│                                                                   │
+│ {"type":"entity","name":"Alice","entityType":"person",           │
+│  "observations":["Software engineer","Works at TechCorp",        │
+│  "Knows Python and TypeScript","Interested in AI/ML"]}           │
+│ {"type":"entity","name":"TechCorp","entityType":"company",       │
+│  "observations":["Tech company","Founded in 2020"]}              │
+│ {"type":"relation","from":"Alice","to":"TechCorp",               │
+│  "relationType":"works_at"}                                       │
+└──────────────────────────────────────────────────────────────────┘
+
+Визуализация графа:
+     Alice (person)
+       ├─ observations:
+       │  • Software engineer
+       │  • Works at TechCorp
+       │  • Knows Python and TypeScript
+       │  • Interested in AI/ML
+       └─ works_at ──→ TechCorp (company)
+                          └─ observations:
+                             • Tech company
+                             • Founded in 2020
+```
+
+---
+
+### 4.2. Knowledge Graph Query Pipeline (Поиск и извлечение)
+
+**Назначение**: Поиск информации в графе знаний и извлечение связанных данных.
+
+**Триггер**: Вызовы инструментов search_nodes, open_nodes, read_graph
+
+**Схема потока данных**:
+```
+┌─────────────────────────────────────────────────────────────────┐
+│           Knowledge Graph Query Pipeline                         │
+└─────────────────────────────────────────────────────────────────┘
+
+ВАРИАНТ A: Поиск по запросу
+   ↓
+┌──────────────────────────────────────────────────────────────────┐
+│ Tool: search_nodes                                                │
+│ { query: "Python" }                                              │
+└──────────────────────────────────────────────────────────────────┘
+   ↓
+┌──────────────────────────────────────────────────────────────────┐
+│ KnowledgeGraphManager.searchNodes()                              │
+│                                                                   │
+│ 1. loadGraph() - загрузка всего графа                           │
+│ 2. Поиск в:                                                       │
+│    - entity.name (case-insensitive)                              │
+│    - entity.entityType (case-insensitive)                        │
+│    - entity.observations (any observation contains query)        │
+│ 3. Фильтрация relations:                                         │
+│    - Только relations между найденными entities                  │
+│ 4. Возврат filtered graph                                        │
+└──────────────────────────────────────────────────────────────────┘
+   ↓
+Response: {
+  entities: [
+    { name: "Alice", entityType: "person",
+      observations: ["...", "Knows Python and TypeScript", ...] }
+  ],
+  relations: []
+}
+
+═══════════════════════════════════════════════════════════════════
+
+ВАРИАНТ B: Открыть конкретные узлы
+   ↓
+┌──────────────────────────────────────────────────────────────────┐
+│ Tool: open_nodes                                                  │
+│ { names: ["Alice", "TechCorp"] }                                 │
+└──────────────────────────────────────────────────────────────────┘
+   ↓
+┌──────────────────────────────────────────────────────────────────┐
+│ KnowledgeGraphManager.openNodes()                                │
+│                                                                   │
+│ 1. loadGraph()                                                    │
+│ 2. Фильтрация entities по имени (строгое совпадение)            │
+│ 3. Фильтрация relations только между этими entities             │
+│ 4. Возврат filtered graph                                        │
+└──────────────────────────────────────────────────────────────────┘
+   ↓
+Response: {
+  entities: [
+    { name: "Alice", ... },
+    { name: "TechCorp", ... }
+  ],
+  relations: [
+    { from: "Alice", to: "TechCorp", relationType: "works_at" }
+  ]
+}
+
+═══════════════════════════════════════════════════════════════════
+
+ВАРИАНТ C: Чтение всего графа
+   ↓
+┌──────────────────────────────────────────────────────────────────┐
+│ Tool: read_graph                                                  │
+│ {}                                                                │
+└──────────────────────────────────────────────────────────────────┘
+   ↓
+┌──────────────────────────────────────────────────────────────────┐
+│ KnowledgeGraphManager.readGraph()                                │
+│                                                                   │
+│ 1. loadGraph() - возврат полного графа                          │
+└──────────────────────────────────────────────────────────────────┘
+   ↓
+Response: {
+  entities: [<все_сущности>],
+  relations: [<все_отношения>]
+}
+```
+
+---
+
+### 4.3. Knowledge Graph Deletion Pipeline (Удаление данных)
+
+**Назначение**: Удаление сущностей, отношений или наблюдений из графа.
+
+**Схема потока данных**:
+```
+┌─────────────────────────────────────────────────────────────────┐
+│         Knowledge Graph Deletion Pipeline                        │
+└─────────────────────────────────────────────────────────────────┘
+
+DELETE ENTITIES (каскадное удаление)
+   ↓
+┌──────────────────────────────────────────────────────────────────┐
+│ Tool: delete_entities                                             │
+│ { entityNames: ["Alice"] }                                       │
+└──────────────────────────────────────────────────────────────────┘
+   ↓
+┌──────────────────────────────────────────────────────────────────┐
+│ KnowledgeGraphManager.deleteEntities()                           │
+│                                                                   │
+│ 1. loadGraph()                                                    │
+│ 2. Удалить entities где name in entityNames                     │
+│ 3. Каскадное удаление relations:                                │
+│    - Удалить где from in entityNames                            │
+│    - Удалить где to in entityNames                              │
+│ 4. saveGraph()                                                    │
+└──────────────────────────────────────────────────────────────────┘
+   ↓
+Response: "Entities deleted successfully"
+
+═══════════════════════════════════════════════════════════════════
+
+DELETE OBSERVATIONS (частичное удаление)
+   ↓
+┌──────────────────────────────────────────────────────────────────┐
+│ Tool: delete_observations                                         │
+│ {                                                                 │
+│   deletions: [                                                    │
+│     {                                                             │
+│       entityName: "Alice",                                        │
+│       observations: ["Knows Python and TypeScript"]               │
+│     }                                                             │
+│   ]                                                               │
+│ }                                                                 │
+└──────────────────────────────────────────────────────────────────┘
+   ↓
+┌──────────────────────────────────────────────────────────────────┐
+│ KnowledgeGraphManager.deleteObservations()                       │
+│                                                                   │
+│ 1. loadGraph()                                                    │
+│ 2. Для каждого entityName:                                       │
+│    - Найти entity                                                │
+│    - Отфильтровать указанные observations                        │
+│ 3. saveGraph()                                                    │
+└──────────────────────────────────────────────────────────────────┘
+   ↓
+Response: "Observations deleted successfully"
+
+═══════════════════════════════════════════════════════════════════
+
+DELETE RELATIONS (точное удаление)
+   ↓
+┌──────────────────────────────────────────────────────────────────┐
+│ Tool: delete_relations                                            │
+│ {                                                                 │
+│   relations: [                                                    │
+│     { from: "Alice", to: "TechCorp", relationType: "works_at" }  │
+│   ]                                                               │
+│ }                                                                 │
+└──────────────────────────────────────────────────────────────────┘
+   ↓
+┌──────────────────────────────────────────────────────────────────┐
+│ KnowledgeGraphManager.deleteRelations()                          │
+│                                                                   │
+│ 1. loadGraph()                                                    │
+│ 2. Отфильтровать relations где НЕ совпадают все 3 поля:         │
+│    (from, to, relationType)                                       │
+│ 3. saveGraph()                                                    │
+└──────────────────────────────────────────────────────────────────┘
+   ↓
+Response: "Relations deleted successfully"
+```
+
+**Формат хранения (memory.jsonl)**:
+```jsonl
+{"type":"entity","name":"Alice","entityType":"person","observations":["..."]}
+{"type":"entity","name":"Bob","entityType":"person","observations":["..."]}
+{"type":"relation","from":"Alice","to":"Bob","relationType":"knows"}
+```
+
+**Ключевые особенности**:
+- **JSONL формат**: каждая строка - отдельный JSON объект (entity или relation)
+- **Дедупликация**: автоматическая при создании entities, relations, observations
+- **Каскадное удаление**: удаление entity удаляет все связанные relations
+- **Поиск**: case-insensitive по всем полям entities
+- **Миграция**: автоматическая миграция из старого memory.json в memory.jsonl
+
+---
+
